@@ -25,25 +25,21 @@ from sklearn.metrics import (
 )
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.neighbors import NearestNeighbors
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 0) One-time downloads
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────── 0) Downloads
 nltk.download("punkt")
 nltk.download("wordnet")
 nltk.download("stopwords")
 nltk.download("vader_lexicon")
 nltk.download("averaged_perceptron_tagger")
-# terminal: python -m spacy download en_core_web_sm
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1) Global NLP tools & constants
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────── 1) Globals
 nlp = spacy.load("en_core_web_sm")
 lemmatizer = WordNetLemmatizer()
 sia = SentimentIntensityAnalyzer()
 stop_words = set(stopwords.words("english"))
-CLICKBAIT_WORDS = {
+CLICKBAIT = {
     "shocking",
     "you",
     "won't believe",
@@ -53,69 +49,93 @@ CLICKBAIT_WORDS = {
     "secret",
     "insane",
 }
+PIPELINE_FILE = "pipeline.joblib"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2) Load data (cached)
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────── 2) Cleaner
+def clean(text: str) -> str:
+    lower = text.lower()
+    tokens = [t for t in word_tokenize(lower) if t.isalpha() and t not in stop_words]
+    lemmas = [lemmatizer.lemmatize(t) for t in tokens]
+    return " ".join(lemmas)
+
+
+# ───────────────────────────────── 3) Plagiarism detector
+class PlagiarismDetector:
+    def __init__(self, t_csv, f_csv, cache="plagiarism_cache", k=5, thr=0.70):
+        self.thr, self.k = thr, k
+        os.makedirs(cache, exist_ok=True)
+        v_path = f"{cache}/vec.joblib"
+        n_path = f"{cache}/nn.joblib"
+        m_path = f"{cache}/meta.parquet"
+        if all(map(os.path.exists, [v_path, n_path, m_path])):
+            self.vec = joblib.load(v_path)
+            self.nn = joblib.load(n_path)
+            self.meta = pd.read_parquet(m_path)
+        else:
+            df = pd.concat(
+                [
+                    pd.read_csv(t_csv).assign(label=1),
+                    pd.read_csv(f_csv).assign(label=0),
+                ],
+                ignore_index=True,
+            )
+            df["clean"] = df["text"].astype(str).apply(clean)
+            self.vec = TfidfVectorizer(
+                max_features=5000, ngram_range=(1, 2), tokenizer=str.split
+            )
+            X = self.vec.fit_transform(df["clean"])
+            self.nn = NearestNeighbors(metric="cosine", n_neighbors=k).fit(X)
+            self.meta = df[["title", "label", "clean"]]
+            joblib.dump(self.vec, v_path)
+            joblib.dump(self.nn, n_path)
+            self.meta.to_parquet(m_path)
+
+    def query(self, text: str):
+        v = self.vec.transform([clean(text)])
+        dist, idx = self.nn.kneighbors(v, self.k)
+        sims = 1 - dist[0]
+        rows = []
+        for r, (i, s) in enumerate(zip(idx[0], sims), 1):
+            rec = self.meta.iloc[i]
+            rows.append(
+                {
+                    "rank": r,
+                    "sim": float(s),
+                    "title": str(rec.title)[:120],
+                    "label": "True" if rec.label else "Fake",
+                    "snippet": rec.clean[:120] + "…",
+                }
+            )
+        return sims[0] >= self.thr, rows
+
+
+detector = PlagiarismDetector("dataset/True.csv", "dataset/Fake.csv")
+
+
+#───────────────────────────────── 4) Data loader
 @st.cache_data
-def load_data(true_path: str, fake_path: str) -> pd.DataFrame:
-    t = pd.read_csv(true_path)
-    f = pd.read_csv(fake_path)
-    t["label"] = 1
-    f["label"] = 0
-    return pd.concat([t, f], ignore_index=True)
+def load_data(t_path,f_path):
+    t=pd.read_csv(t_path);f=pd.read_csv(f_path)
+    t["label"]=1;f["label"]=0;return pd.concat([t,f],ignore_index=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3) Basic preprocessing & dense features
-# ─────────────────────────────────────────────────────────────────────────────
-def preprocess_and_extract_features(texts: list[str]) -> tuple[list[str], np.ndarray]:
-    cleaned, feats = [], []
-    for doc in texts:
-        lower = doc.lower()
-        # readability
-        flesch = textstat.flesch_reading_ease(lower)
-        gunning = textstat.gunning_fog(lower)
-        # tokenize, filter, lemmatize
-        toks = [t for t in word_tokenize(lower) if t.isalpha() and t not in stop_words]
-        lemmas = [lemmatizer.lemmatize(t) for t in toks]
-        clean_str = " ".join(lemmas)
-        cleaned.append(clean_str)
-        # POS ratios
-        tags = pos_tag(lemmas)
-        total = len(tags) or 1
-        adj_ratio = sum(p.startswith("JJ") for _, p in tags) / total
-        noun_ratio = sum(p.startswith("NN") for _, p in tags) / total
-        # NER counts
-        ents = [e.label_ for e in nlp(clean_str).ents]
-        person, org, gpe = ents.count("PERSON"), ents.count("ORG"), ents.count("GPE")
-        # sentiment
-        vs = sia.polarity_scores(lower)
-        compound, pos_s, neg_s = vs["compound"], vs["pos"], vs["neg"]
-        # clickbait
-        cb = sum(lower.count(w) for w in CLICKBAIT_WORDS)
-        feats.append(
-            [
-                flesch,
-                gunning,
-                adj_ratio,
-                noun_ratio,
-                person,
-                org,
-                gpe,
-                compound,
-                pos_s,
-                neg_s,
-                cb,
-            ]
-        )
-    return cleaned, np.array(feats)
+#───────────────────────────────── 5) Feature extractor
+def preprocess_and_extract_features(texts):
+    cl,fe=[],[]
+    for d in texts:
+        low=d.lower(); fles=textstat.flesch_reading_ease(low); gun=textstat.gunning_fog(low)
+        toks=[t for t in word_tokenize(low) if t.isalpha() and t not in stop_words]
+        lem=[lemmatizer.lemmatize(t) for t in toks]; c=" ".join(lem); cl.append(c)
+        tags=pos_tag(lem); tot=len(tags)or 1
+        adj=sum(p.startswith("JJ") for _,p in tags)/tot; noun=sum(p.startswith("NN") for _,p in tags)/tot
+        ents=[e.label_ for e in nlp(c).ents]; per,org,gpe=ents.count("PERSON"),ents.count("ORG"),ents.count("GPE")
+        vs=sia.polarity_scores(low); cb=sum(low.count(w) for w in CLICKBAIT)
+        fe.append([fles,gun,adj,noun,per,org,gpe,vs["compound"],vs["pos"],vs["neg"],cb])
+    return cl,np.array(fe)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4) Topic modeling
-# ─────────────────────────────────────────────────────────────────────────────
+#───────────────────────────────── 6) Topic modeling
 def get_topic_distributions(texts: list[str], n_topics: int = 5):
     cv = CountVectorizer(max_features=5000, stop_words="english")
     counts = cv.fit_transform(texts)
@@ -126,9 +146,7 @@ def get_topic_distributions(texts: list[str], n_topics: int = 5):
     return cv, lda, tops
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5) Full pipeline (baseline & enriched) + cache in‐session
-# ─────────────────────────────────────────────────────────────────────────────
+#───────────────────────────────── 6) Full pipeline
 @st.cache_resource
 def run_pipeline(data: pd.DataFrame) -> dict:
     # Demo sample
@@ -224,12 +242,7 @@ def run_pipeline(data: pd.DataFrame) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6) Persist pipeline across restarts
-# ─────────────────────────────────────────────────────────────────────────────
-PIPELINE_FILE = "pipeline.joblib"
-
-
+#───────────────────────────────── 7) Check if the pipeline is loaded
 def load_or_train_pipeline(data: pd.DataFrame) -> dict:
     if os.path.exists(PIPELINE_FILE):
         return joblib.load(PIPELINE_FILE)
@@ -238,9 +251,7 @@ def load_or_train_pipeline(data: pd.DataFrame) -> dict:
     return pipe
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7) NLP demo steps + explanations
-# ─────────────────────────────────────────────────────────────────────────────
+#───────────────────────────────── 8) NLP demo steps + explanations
 def demo_nlp_steps(text: str) -> dict:
     lower = text.lower()
     tokens = word_tokenize(lower)
@@ -289,20 +300,26 @@ def demo_nlp_steps(text: str) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8) Streamlit multipage
-# ─────────────────────────────────────────────────────────────────────────────
+#───────────────────────────────── 9) Streamlit multipage
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["1. Run Models", "2. NLP Demo", "3. Predict"])
+page = st.sidebar.radio(
+    "Select a page",
+    [
+        "1. Train & Evaluate Models",
+        "2. Pre-processing Walk-Through",
+        "3. Real-Time Fake-News Prediction",
+        "4. Plagiarism Similarity Search",
+    ],
+)
 
 data = load_data(
     "C:/Users/Asus/Downloads/News Classifier/dataset/True.csv",
     "C:/Users/Asus/Downloads/News Classifier/dataset/Fake.csv",
 )
 
-if page == "1. Run Models":
-    st.title("1️⃣ Compare Baseline vs. Enriched")
-    if st.button("▶️ Run or Load Pipeline"):
+if page == "1. Train & Evaluate Models":
+    st.title("1️⃣ Train, Evaluate & Visualise Models")
+    if st.button("▶️ Start training the model (or load it)"):
         pipe = load_or_train_pipeline(data)
         st.session_state["pipe"] = pipe
         st.session_state["ran"] = True
@@ -353,8 +370,8 @@ if page == "1. Run Models":
             ax.set_ylabel("Actual")
             st.pyplot(fig)
 
-elif page == "2. NLP Demo":
-    st.title("2️⃣ NLP Preprocessing Demo")
+elif page == "2. Pre-processing Walk-Through":
+    st.title("2️⃣ NLP Step-by-Step Demo")
     if not st.session_state.get("ran"):
         st.warning("▶️ First run models on Page 1")
     else:
@@ -375,8 +392,8 @@ elif page == "2. NLP Demo":
         df_feats["Description"] = df_feats.index.map(steps["descriptions"])
         st.table(df_feats)
 
-elif page == "3. Predict":
-    st.title("3️⃣ Predict New Text")
+elif page == "3. Real-Time Fake-News Prediction":
+    st.title("3️⃣ Classify Custom Text in Real Time")
     if not st.session_state.get("ran"):
         st.warning("▶️ First run models on Page 1")
     else:
@@ -416,3 +433,18 @@ elif page == "3. Predict":
                 proba = model.predict_proba(X_in)[0][pred]
                 label = "True" if pred == 1 else "Fake"
                 st.write(f"**{name}:** {label} _(prob={proba:.2f})_")
+
+elif page == "4. Plagiarism Similarity Search":
+    st.title("4️⃣ Plagiarism / Similarity Detection")
+    txt = st.text_area("Paste a news article or paragraph:")
+    if st.button("🔎 Find Similar Articles") and txt:
+        plag, rows = detector.query(txt)
+        st.subheader("Verdict")
+        st.error(
+            "⚠️ Potential plagiarism detected!" if plag else "✅ No close match found."
+        )
+        st.subheader("Top similar corpus articles")
+        for r in rows:
+            st.write(f"**{r['rank']}** (sim={r['sim']:.3f}) — {r['label']} news")
+            st.write(f"*{r['title']}*")
+            st.caption(r["snippet"])
