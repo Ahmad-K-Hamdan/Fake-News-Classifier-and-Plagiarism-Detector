@@ -23,18 +23,6 @@ Additionally, the app provides a **Plagiarism Detector** that finds news article
 
 ---
 
-## 📂 Repository Structure
-
-```
-.
-├── app.py                 # Main Streamlit application
-├── requirements.txt       # Python dependencies
-├── pipeline.joblib        # (auto-generated) Serialized pipeline artifacts
-└── README.md              # Project README
-```
-
----
-
 ## 🔧 Installation
 
 1. **Clone** this repository:
